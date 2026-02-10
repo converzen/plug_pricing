@@ -4,17 +4,21 @@
 //! It demonstrates the async MCP plugin API with automatic runtime management
 //! and configuration support.
 
-use log::debug;
+
 use mcp_plugin_api::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Pool, Postgres};
-use std::sync::mpsc;
+use sqlx::{PgPool, Pool, Postgres};
 
-use std::time::Duration;
+
 use tokio::runtime::Runtime;
+
+use std::sync::OnceLock;
+use tokio::sync::{mpsc, oneshot};
+
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -61,9 +65,6 @@ declare_config_schema!(PluginConfig);
 // Database Setup
 // ============================================================================
 
-// Database connection pool (initialized once, shared across threads)
-static DB_POOL: once_cell::sync::OnceCell<Pool<Postgres>> = once_cell::sync::OnceCell::new();
-static RUNTIME: once_cell::sync::OnceCell<Runtime> = once_cell::sync::OnceCell::new();
 
 /// Product information from database
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
@@ -85,95 +86,88 @@ async fn init_db_pool() -> Result<Pool<Postgres>, sqlx::Error> {
         .await
 }
 
-/// Get the database pool (panics if not initialized)
-fn get_db_pool() -> &'static Pool<Postgres> {
-    DB_POOL
-        .get()
-        .expect("Database pool not initialized - init() must be called first")
-}
 
 // ============================================================================
 // Plugin Initialization
 // ============================================================================
+
+static TX: OnceLock<mpsc:: UnboundedSender<Command>> = OnceLock::new();
+
+struct McpRequest {
+    payload: Value,
+    responder: oneshot::Sender<Result<Value, String>>,
+}
+
+enum Command {
+    GetProductPrice(McpRequest),
+    SearchProducts(McpRequest),
+}
 
 enum InitResult {
     Success,
     Error(String),
 }
 
-fn start_runtime_thread() -> Result<(), String> {
-    // let config = get_config();
-    let (tx, rx) = mpsc::channel();
+fn ensure_runtime() -> &'static mpsc::UnboundedSender<Command> {
+    TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
 
-    std::thread::spawn::<_, Result<(), String>>(move || {
-        debug!("starting async runtime");
+        let (init_tx, init_rx) = oneshot::channel::<InitResult>();
+        // Spawn a dedicated OS thread for our async world
+        std::thread::spawn(move || {
+            let rt = match Runtime::new() {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = init_tx.send(InitResult::Error(err.to_string()));
+                    return;
+                }
+            };
+            rt.block_on(async {
+                // async initialization her
+                let pool = match init_db_pool().await {
+                    Ok(pool) => pool,
+                    Err(err) => {
+                        let _ = init_tx.send(InitResult::Error(err.to_string()));
+                        return
+                    }
+                };
 
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(err) => {
-                let message = format!("failed to create runtime: {err}");
-                tx.send(InitResult::Error(message))
-                    .expect("failed to send message");
-                return Ok(());
-            }
-        };
+                let _ = init_tx.send(InitResult::Success);
 
-        RUNTIME.get_or_init(|| runtime);
-        tx.send(InitResult::Success)
-            .expect("failed to send message");
+                while let Some(req) = rx.recv().await {
+                    // Spawn a task for every request to allow internal parallelism
+                    let pool_cpy = pool.clone();
+                    tokio::spawn(async move {
+                        match req {
+                            Command::GetProductPrice(req) => {
+                                let result = handle_get_product_price(&pool_cpy, &req.payload).await;
+                                let _ = req.responder.send(result);
+                            }
+                            Command::SearchProducts(req) => {
+                                let result = handle_search_products( &pool_cpy, &req.payload   ).await;
+                                let _ = req.responder.send(result);
+                            }
+                        }
+                    });
+                }
+            });
+        });
 
-        loop {
-            RUNTIME
-                .get()
-                .unwrap()
-                .block_on(tokio::time::sleep(Duration::from_secs(604800)))
+        match init_rx.blocking_recv().unwrap() {
+            InitResult::Success => tx,
+            InitResult::Error(msg) => panic!("{}", msg),
         }
-    });
-
-    let res = rx
-        .recv()
-        .map_err(|err| format!("Async thread receive error: {err}"))?;
-    match res {
-        InitResult::Success => Ok(()),
-        InitResult::Error(message) => Err(message),
-    }
+    })
 }
+
 
 /// Initialize plugin resources
 ///
 /// This is called by the framework after configuration is set.
 /// It validates the config and initializes the database connection.
 fn init() -> Result<(), String> {
-    start_runtime_thread()?;
-
-    let config = get_config();
-    // Validate configuration
-    if config.max_connections == 0 {
-        return Err("max_connections must be greater than 0".to_string());
-    }
-
-    // Create a runtime for initialization
-    // Connect to database
-    let pool = RUNTIME
-        .get()
-        .unwrap()
-        .block_on(init_db_pool())
-        .map_err(|e| format!("Failed to connect to database: {e}"))?;
-
-    // Validate the connection works
-    RUNTIME
-        .get()
-        .unwrap()
-        .block_on(async { sqlx::query("SELECT 1").execute(&pool).await })
-        .map_err(|e| format!("Database validation query failed: {e}"))?;
-
-    // Store the pool
-    DB_POOL
-        .set(pool)
-        .map_err(|_| "Database pool already initialized".to_string())?;
+    // Create the async runtime
+    let _tx = ensure_runtime();
 
     Ok(())
 }
@@ -187,13 +181,21 @@ declare_plugin_init!(init);
 
 /// Handler for get_product_price tool
 fn handle_get_product_price_sync(args: &Value) -> Result<Value, String> {
-    RUNTIME
-        .get()
-        .unwrap()
-        .block_on(handle_get_product_price(args))
+    let tx = ensure_runtime();
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    // 1. Offload work to the dedicated runtime
+    tx.send(Command::GetProductPrice(McpRequest {
+        payload: args.clone(),
+        responder: resp_tx,
+    })).ok();
+
+    // 2. BLOCK the host thread using a light-weight executor
+    // This does NOT try to start a new runtime, so it won't panic.
+    futures::executor::block_on(resp_rx).map_err(|err| err.to_string())?
 }
 
-async fn handle_get_product_price(args: &Value) -> Result<Value, String> {
+async fn handle_get_product_price(pool: &PgPool, args: &Value) -> Result<Value, String> {
     // Extract and validate product_id
     let product_id = args["product_id"]
         .as_i64()
@@ -204,7 +206,7 @@ async fn handle_get_product_price(args: &Value) -> Result<Value, String> {
         "SELECT id, name, price, description FROM products WHERE id = $1",
     )
     .bind(product_id)
-    .fetch_optional(get_db_pool())
+    .fetch_optional(pool)
     .await
     .map_err(|e| format!("Database error: {e}"))?;
 
@@ -225,14 +227,22 @@ async fn handle_get_product_price(args: &Value) -> Result<Value, String> {
 }
 
 /// Handler for search_products tool
-fn handle_search_products_sync(args: &Value) -> Result<Value, String> {
-    RUNTIME
-        .get()
-        .unwrap()
-        .block_on(handle_search_products(args))
+fn handle_search_products_sync( args: &Value) -> Result<Value, String> {
+    let tx = ensure_runtime();
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    // 1. Offload work to the dedicated runtime
+    tx.send(Command::SearchProducts(McpRequest {
+        payload: args.clone(),
+        responder: resp_tx,
+    })).ok();
+
+    // 2. BLOCK the host thread using a light-weight executor
+    // This does NOT try to start a new runtime, so it won't panic.
+    futures::executor::block_on(resp_rx).map_err(|err| err.to_string())?
 }
 
-async fn handle_search_products(args: &Value) -> Result<Value, String> {
+async fn handle_search_products(pool: &PgPool, args: &Value) -> Result<Value, String> {
     // Extract and validate query
     let query = args["query"]
         .as_str()
@@ -243,7 +253,7 @@ async fn handle_search_products(args: &Value) -> Result<Value, String> {
         "SELECT id, name, price, description FROM products WHERE name ILIKE $1",
     )
     .bind(format!("%{query}%",))
-    .fetch_all(get_db_pool())
+    .fetch_all(pool)
     .await
     .map_err(|e| format!("Database error: {e}"))?;
 
