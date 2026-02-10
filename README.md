@@ -1,6 +1,6 @@
 # plug_pricing
 
-Sample plugin implementation for CoverZen MCP plugins.
+Sample plugin implementation for ConverZen MCP plugins.
 
 ## Description
 
