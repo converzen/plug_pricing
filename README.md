@@ -17,11 +17,11 @@ A rust MCP plugin within the *ConverZen* architecture has a C API interface that
 of async and await. So the rust function being called as a tool handler inside the plugin is called
 synchronously but from within an async tokio runtime (that of the MCP server).
 From the perspective of the MCP server its worker task  calls a synchronous function that
-blocks its executing until it returns.
+blocks until it returns.
 
 As a result in most cases using an asynchronous runtime inside the plugin makes no sense.
 You are better of using synchronous tools. That is also true for this plugin implementation. 
-Nevertheless we found that it makes sense to show how it should be done from our point of view.
+Nevertheless we found that it makes sense to show how it could be done from our point of view.
 
 
 In the following we discuss when it makes sense to go async inside the plugin and how it is done.
