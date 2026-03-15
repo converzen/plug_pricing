@@ -91,7 +91,7 @@ async fn init_db_pool() -> Result<Pool<Postgres>, sqlx::Error> {
 // Plugin Initialization
 // ============================================================================
 
-static TX: OnceLock<mpsc:: UnboundedSender<Command>> = OnceLock::new();
+static TX: OnceLock<mpsc::UnboundedSender<Command>> = OnceLock::new();
 
 struct McpRequest {
     payload: Value,
